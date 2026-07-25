@@ -1,82 +1,132 @@
-#python imports
+# python imports
 import pandas as pd
 import numpy as np
+from xgboost import XGBRegressor
 from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.metrics import mean_squared_error, root_mean_squared_error
+from sklearn.metrics import root_mean_squared_error
 
-# labeling data and the column names with its unit ID, time in cycles, and the 3 engine settings, and 21 sensor reads
+
+#label for dataset columns -> unit id, flight cycle number, 3 engine setting and 21 sensor readings
 columns = ["unitnum", "timecycle", "setting1", "setting2", "setting3"] \
         + [f"s_{i}" for i in range(1, 22)]
 
-# read the text file into a df (DataFrame).
+#read the text file into a DataFrame (table)
 df = pd.read_csv("nasadata/train_FD001.txt", sep=r"\s+",
                  header=None, names=columns)
 
-# find each engines last cycle or max lifetime
+#sort rows by engine ID then by flight cycle
+df = df.sort_values(["unitnum", "timecycle"]).reset_index(drop=True)
+
+
+#for each engine find its last recorded cycle (= total lifespan)
 max_lifetime = df.groupby("unitnum")["timecycle"].max().rename("max_lifetime")
 
-# bring max_lifetime back into df so every row knows its engines total lifespan
+#merge it back so every row knows its engines total lifespan
 df = df.merge(max_lifetime, on="unitnum")
 
-# RUL = total lifespan minus the current cycle number
-# meaning a brand-new engine (cycle 1) gets a high  and its the opposite for a dying one
+#RUL = total lifespan - current cycle
 df["RUL"] = df["max_lifetime"] - df["timecycle"]
 
-# cap RUL at 125 so model doesnt get confuseds
+#cap RUL at 125 so that model doesnt get confused
 df["RUL"] = df["RUL"].clip(upper=125)
 
-# drop the columns that never change -> variance == 0
-constant_cols = [col for col in df.columns
-                 if df[col].std() == 0]
-print(f"Dropping constant columns: {constant_cols}")
+
+#drop columns that never change (standard deviation = 0).
+constant_cols = [col for col in df.columns if df[col].std() == 0]
+print(f"dropping constant columns: {constant_cols}")
 df.drop(columns=constant_cols, inplace=True)
 
-# now we can drop the helper column we created because it was only needed to calculate RUL
+#drop the helper column (dont need it anymore because we have RUL)
 df.drop(columns=["max_lifetime"], inplace=True)
 
-#we have to see how each sensor has behaved in the last 5 cycles
 
+#now just checking the last 10 flight cycles
 sensor_cols = [c for c in df.columns if c.startswith("s_")]
-window = 5
+window = 10
+
+#build all new features in a dict
+new_features = {}
 
 for col in sensor_cols:
-    # rolling mean = the smoothed sensor value
-    df[f"{col}_mean_{window}"] = (
-        df.groupby("unitnum")[col]
-          .transform(lambda x: x.rolling(window, min_periods=1).mean())
-    )
-    # rolling std = how volatile the sensor is
-    df[f"{col}_std_{window}"] = (
-        df.groupby("unitnum")[col]
-          .transform(lambda x: x.rolling(window, min_periods=1).std().fillna(0))
+    #         groupby engine so we calculate features per engine
+    group = df.groupby("unitnum")[col]
+
+    # rolling mean = average of the last 10 cycles
+    new_features[f"{col}_mean"] = group.transform(
+        lambda x: x.rolling(window, min_periods=1).mean()
     )
 
+    # rolling std = standard deviation of last 10
+    new_features[f"{col}_std"] = group.transform(
+        lambda x: x.rolling(window, min_periods=1).std().fillna(0)
+    )
 
-#original settings + the new rolling features
+    # slope = steepness of trend of the sensor in last 10 cycles
+    def get_slope(x):
+        if len(x) < 2:
+            return 0
+
+        return np.polyfit(np.arange(len(x)), x, 1)[0]
+
+    new_features[f"{col}_slope"] = group.transform(
+        lambda x: x.rolling(window, min_periods=2).apply(get_slope, raw=True)
+    )
+
+    # diff = between min and max
+
+    new_features[f"{col}_diff"] = group.diff().fillna(0)
+
+    # min and max within the window = the range of values
+    new_features[f"{col}_min"] = group.transform(
+        lambda x: x.rolling(window, min_periods=1).min()
+    )
+    new_features[f"{col}_max"] = group.transform(
+        lambda x: x.rolling(window, min_periods=1).max()
+    )
+
+# add all new columns at once instead of one by one
+df = pd.concat([df, pd.DataFrame(new_features, index=df.index)], axis=1)
+
+# cycle_ratio = what percentage of its life has this engine completed
+max_lifetime = df.groupby("unitnum")["timecycle"].max().rename("max_lifetime_temp")
+df = df.merge(max_lifetime, on="unitnum")
+df["cycle_ratio"] = df["timecycle"] / df["max_lifetime_temp"]
+df.drop(columns=["max_lifetime_temp"], inplace=True)
+
+# drop the original raw sensor columns because we have the features we need
+df.drop(columns=sensor_cols, inplace=True)
+
+
+# separate features (X) from the target (y = RUL)
 feature_cols = [c for c in df.columns
                 if c not in ["unitnum", "timecycle", "RUL"]]
 
 print(f"\ntotal features: {len(feature_cols)}")
-print(f"Total samples:  {len(df)}")
-
-
-# seperate the features (X) from the target (y = RUL)
+print(f"total samples:  {len(df)}")
 X = df[feature_cols]
 y = df["RUL"]
 
-# 80% for training adn 20% for testing it.
+# 80% trainingand 20% testing
 X_train, X_test, y_train, y_test = train_test_split(
     X, y, test_size=0.2, random_state=42
 )
+# switched this part from Random Forest to XGBoost because
+# Random Forest builds all trees independently then averages but XGBoost builds trees one at a time where each new tree fixes the mistakes the previous trees did
 
-# RandomForestRegressor is going to build 100 decision trees on random subsets of the data and average predictions
-model = RandomForestRegressor(n_estimators=100, random_state=42)
+#using 500 trees with 5percent correction on 80% of training data and same percent on features
+model = XGBRegressor(
+    n_estimators=500,
+    learning_rate=0.05,
+    max_depth=6,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    random_state=42,
+    objective="reg:squarederror"  # regression (predicting a number) and minimize squared error
+
+)
 model.fit(X_train, y_train)
-
-# now we make the predictions on the testing data.
+# predict RUL for the test set
 y_pred = model.predict(X_test)
-
-# find the Root Mean Squared Error (RMSE). looking for a lower number here (fingers crossed)
+# RMSE = root mean squared error calculation looking for below 10 for a success
 rmse = root_mean_squared_error(y_test, y_pred)
-print(f"\nModel RMSE: {rmse:.2f} flight cycles")
+print(f"\nxgboost RMSE: {rmse:.2f} flight cycles")
