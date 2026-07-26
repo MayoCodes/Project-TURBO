@@ -121,7 +121,8 @@ model = XGBRegressor(
     subsample=0.8,
     colsample_bytree=0.8,
     random_state=42,
-    objective="reg:squarederror"  # regression (predicting a number) and minimize squared error
+    objective="reg:squarederror"
+    # regression (predicting a number) and minimize squared error
 
 )
 model.fit(X_train, y_train)
